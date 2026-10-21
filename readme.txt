@@ -2,7 +2,7 @@
 Contributors: hostetlerweb
 Requires at least: 5.6
 Requires PHP: 7.4
-Stable tag: 1.1.0
+Stable tag: 1.1.1
 License: GPL-2.0-or-later
 
 Read-only report for the Hostetler Web dashboard.
@@ -14,6 +14,9 @@ Adds one REST endpoint, GET /wp-json/hw-monitor/v1/report, that answers only req
 There are no settings and no key to enter: installing it is the whole setup. Answering a request changes nothing on the site. Updates install automatically from GitHub releases.
 
 == Changelog ==
+
+= 1.1.1 =
+* Reports are never stored by RunCloud's nginx page cache (X-Accel-Expires: 0). It ignored Cache-Control, so a signed report could be replayed to anyone and the dashboard got stale copies.
 
 = 1.1.0 =
 * Independent Analytics traffic: daily visitors, sessions and views; form submissions by form, orders (count and order value) and link clicks; top pages, channels, referrers and UTM campaigns. Read from IA's tables with a few summary queries, counted in the site's timezone.

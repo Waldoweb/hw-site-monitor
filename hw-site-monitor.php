@@ -3,7 +3,7 @@
  * Plugin Name:       HW Site Monitor
  * Plugin URI:        https://github.com/Waldoweb/hw-site-monitor
  * Description:       Read-only report for the Hostetler Web dashboard: WordPress, PHP, plugin and theme versions, pending updates, and Independent Analytics traffic and conversions. Answers only requests signed by the dashboard, and reading the report changes nothing on the site.
- * Version:           1.1.0
+ * Version:           1.1.1
  * Author:            Hostetler Web
  * Author URI:        https://hostetlerweb.com
  * Update URI:        https://github.com/Waldoweb/hw-site-monitor
@@ -15,7 +15,7 @@
 
 defined( 'ABSPATH' ) || exit;
 
-define( 'HW_MONITOR_VERSION', '1.1.0' );
+define( 'HW_MONITOR_VERSION', '1.1.1' );
 
 // Updates come from GitHub releases through Plugin Update Checker. Pushing a vX.Y.Z
 // tag builds the release zip (.github/workflows/release.yml); sites check every 6
@@ -227,6 +227,9 @@ function hw_monitor_report( $request = null ) {
 		$response->set_data( $data );
 	}
 	$response->header( 'Cache-Control', 'no-store, private' );
+	// RunCloud's nginx page cache ignores Cache-Control (proxy_ignore_headers) and would replay a
+	// signed report to anyone. It does honour X-Accel-Expires, where 0 means "never cache this".
+	$response->header( 'X-Accel-Expires', '0' );
 	return $response;
 }
 
