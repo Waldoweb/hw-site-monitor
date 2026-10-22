@@ -3,7 +3,7 @@
  * Plugin Name:       HW Site Monitor
  * Plugin URI:        https://github.com/Waldoweb/hw-site-monitor
  * Description:       Read-only report for the Hostetler Web dashboard: WordPress, PHP, plugin and theme versions, pending updates, and Independent Analytics traffic and conversions. Answers only requests signed by the dashboard, and reading the report changes nothing on the site.
- * Version:           1.1.1
+ * Version:           1.2.0
  * Author:            Hostetler Web
  * Author URI:        https://hostetlerweb.com
  * Update URI:        https://github.com/Waldoweb/hw-site-monitor
@@ -15,7 +15,7 @@
 
 defined( 'ABSPATH' ) || exit;
 
-define( 'HW_MONITOR_VERSION', '1.1.1' );
+define( 'HW_MONITOR_VERSION', '1.2.0' );
 
 // Updates come from GitHub releases through Plugin Update Checker. Pushing a vX.Y.Z
 // tag builds the release zip (.github/workflows/release.yml); sites check every 6
@@ -46,7 +46,8 @@ require_once __DIR__ . '/public-keys.php';
  * - Headers X-HW-Timestamp (unix seconds) and X-HW-Signature (base64 Ed25519 signature).
  * - Signed message: "hw-monitor-v1\nGET\n{host}\n{route}\n{timestamp}", where host is this
  *   site's own host (from home_url, without "www.") and route is "/hw-monitor/v1/report".
- *   A traffic request (1.1+) adds a sixth line with its query, "from=…&to=…" (plus "&tops=1"),
+ *   A traffic request (1.1+) adds a sixth line with its query, "from=…&to=…" (plus "&tops=1",
+ *   and in 1.2+ "&tops_only=1"),
  *   so a captured request can't be replayed for a different date range.
  * - The timestamp must be within 5 minutes, and the signature must match one of the dashboard's
  *   public keys in public-keys.php. There's no secret on the site: the private key exists only
@@ -129,14 +130,14 @@ function hw_monitor_verify_request( $request ) {
 	return $deny;
 }
 
-/** The traffic part of a request in the fixed order it's signed: "from=…&to=…[&tops=1]", or "". */
+/** The traffic part of a request in the fixed order it's signed: "from=…&to=…[&tops=1][&tops_only=1]", or "". */
 function hw_monitor_signed_query( $request ) {
 	$from = (string) $request->get_param( 'from' );
 	$to   = (string) $request->get_param( 'to' );
 	if ( '' === $from && '' === $to ) {
 		return '';
 	}
-	return 'from=' . $from . '&to=' . $to . ( $request->get_param( 'tops' ) ? '&tops=1' : '' );
+	return 'from=' . $from . '&to=' . $to . ( $request->get_param( 'tops' ) ? '&tops=1' : '' ) . ( $request->get_param( 'tops_only' ) ? '&tops_only=1' : '' );
 }
 
 /** Everything here is read from WordPress; nothing is changed. */
@@ -223,7 +224,7 @@ function hw_monitor_report( $request = null ) {
 	);
 	if ( $request instanceof WP_REST_Request && '' !== hw_monitor_signed_query( $request ) ) {
 		$data            = $response->get_data();
-		$data['traffic'] = hw_monitor_ia_traffic( (string) $request->get_param( 'from' ), (string) $request->get_param( 'to' ), (bool) $request->get_param( 'tops' ) );
+		$data['traffic'] = hw_monitor_ia_traffic( (string) $request->get_param( 'from' ), (string) $request->get_param( 'to' ), (bool) $request->get_param( 'tops' ), (bool) $request->get_param( 'tops_only' ) );
 		$response->set_data( $data );
 	}
 	$response->header( 'Cache-Control', 'no-store, private' );
@@ -346,9 +347,10 @@ function hw_monitor_local_day( $utc_hour, $tz ) {
 
 /**
  * Daily totals for local days $from..$to (at most 31), plus conversions, and top pages,
- * referrers, channels and campaigns when $tops.
+ * referrers, channels and campaigns when $tops. With $tops_only (1.2+) it's just the totals and
+ * top lists, for up to 366 days: the dashboard's 90-day and 12-month views.
  */
-function hw_monitor_ia_traffic( $from, $to, $tops ) {
+function hw_monitor_ia_traffic( $from, $to, $tops, $tops_only = false ) {
 	global $wpdb;
 	$ia = hw_monitor_ia_status();
 	if ( empty( $ia['installed'] ) ) {
@@ -368,58 +370,64 @@ function hw_monitor_ia_traffic( $from, $to, $tops ) {
 	} catch ( Exception $e ) {
 		return array( 'available' => false, 'reason' => 'Invalid date' );
 	}
-	if ( $start->diff( $end )->days > 30 ) {
-		return array( 'available' => false, 'reason' => 'At most 31 days per request' );
+	if ( $start->diff( $end )->days > ( $tops_only ? 365 : 30 ) ) {
+		return array( 'available' => false, 'reason' => $tops_only ? 'At most 366 days per top-lists request' : 'At most 31 days per request' );
 	}
+	$tops = $tops || $tops_only;
 
 	$p        = $wpdb->prefix . 'independent_analytics_';
 	$range_lo = hw_monitor_utc_midnight( $from, $tz );
 	$range_hi = hw_monitor_utc_midnight( $end->modify( '+1 day' )->format( 'Y-m-d' ), $tz );
 
-	// One small indexed range query per day: sessions, distinct visitors, page views.
-	$days = array();
-	for ( $d = $start; $d <= $end; $d = $d->modify( '+1 day' ) ) {
-		$day  = $d->format( 'Y-m-d' );
-		$lo   = hw_monitor_utc_midnight( $day, $tz );
-		$hi   = hw_monitor_utc_midnight( $d->modify( '+1 day' )->format( 'Y-m-d' ), $tz );
-		$sess = $wpdb->get_row( $wpdb->prepare( "SELECT COUNT(*) AS sessions, COUNT(DISTINCT visitor_id) AS visitors FROM `{$p}sessions` WHERE created_at >= %s AND created_at < %s", $lo, $hi ), ARRAY_A );
-		$view = (int) $wpdb->get_var( $wpdb->prepare( "SELECT COUNT(*) FROM `{$p}views` WHERE viewed_at >= %s AND viewed_at < %s", $lo, $hi ) );
-		$days[] = array(
-			'day'      => $day,
-			'visitors' => (int) $sess['visitors'],
-			'sessions' => (int) $sess['sessions'],
-			'views'    => $view,
-		);
-	}
-
-	// Conversions, counted per UTC hour in SQL and placed on local days here.
-	$by_hour = function ( $sql ) use ( $wpdb ) {
-		return (array) $wpdb->get_results( $sql, ARRAY_A );
-	};
-	$forms = array();
-	if ( $ia['forms'] ) {
-		foreach ( $by_hour( $wpdb->prepare( "SELECT COALESCE(f.cached_form_title, CONCAT('Form ', fs.form_id)) AS form, DATE_FORMAT(fs.created_at, '%%Y-%%m-%%d %%H') AS h, COUNT(*) AS n FROM `{$p}form_submissions` fs LEFT JOIN `{$p}forms` f ON f.form_id = fs.form_id WHERE fs.created_at >= %s AND fs.created_at < %s GROUP BY form, h", $range_lo, $range_hi ) ) as $r ) {
-			$k = hw_monitor_local_day( $r['h'], $tz ) . "\0" . $r['form'];
-			$forms[ $k ] = ( isset( $forms[ $k ] ) ? $forms[ $k ] : 0 ) + (int) $r['n'];
-		}
-	}
+	$days   = array();
+	$forms  = array();
 	$orders = array();
-	if ( $ia['orders'] ) {
-		foreach ( $by_hour( $wpdb->prepare( "SELECT DATE_FORMAT(created_at, '%%Y-%%m-%%d %%H') AS h, COUNT(*) AS n, COALESCE(SUM(total), 0) AS total, COALESCE(SUM(total_refunded), 0) AS refunded FROM `{$p}orders` WHERE is_included_in_analytics = 1 AND created_at >= %s AND created_at < %s GROUP BY h", $range_lo, $range_hi ) ) as $r ) {
-			$k = hw_monitor_local_day( $r['h'], $tz );
-			if ( ! isset( $orders[ $k ] ) ) {
-				$orders[ $k ] = array( 'day' => $k, 'orders' => 0, 'revenue_cents' => 0, 'refunded_cents' => 0 );
-			}
-			$orders[ $k ]['orders']         += (int) $r['n'];
-			$orders[ $k ]['revenue_cents']  += (int) $r['total'];
-			$orders[ $k ]['refunded_cents'] += (int) $r['refunded'];
-		}
-	}
 	$clicks = array();
-	if ( $ia['clicks'] ) {
-		foreach ( $by_hour( $wpdb->prepare( "SELECT DATE_FORMAT(created_at, '%%Y-%%m-%%d %%H') AS h, COUNT(*) AS n FROM `{$p}clicks` WHERE created_at >= %s AND created_at < %s GROUP BY h", $range_lo, $range_hi ) ) as $r ) {
-			$k = hw_monitor_local_day( $r['h'], $tz );
-			$clicks[ $k ] = ( isset( $clicks[ $k ] ) ? $clicks[ $k ] : 0 ) + (int) $r['n'];
+	if ( ! $tops_only ) {
+		// One small indexed range query per day: sessions, distinct visitors, page views.
+		for ( $d = $start; $d <= $end; $d = $d->modify( '+1 day' ) ) {
+			$day  = $d->format( 'Y-m-d' );
+			$lo   = hw_monitor_utc_midnight( $day, $tz );
+			$hi   = hw_monitor_utc_midnight( $d->modify( '+1 day' )->format( 'Y-m-d' ), $tz );
+			$sess = $wpdb->get_row( $wpdb->prepare( "SELECT COUNT(*) AS sessions, COUNT(DISTINCT visitor_id) AS visitors FROM `{$p}sessions` WHERE created_at >= %s AND created_at < %s", $lo, $hi ), ARRAY_A );
+			$view = (int) $wpdb->get_var( $wpdb->prepare( "SELECT COUNT(*) FROM `{$p}views` WHERE viewed_at >= %s AND viewed_at < %s", $lo, $hi ) );
+			$days[] = array(
+				'day'      => $day,
+				'visitors' => (int) $sess['visitors'],
+				'sessions' => (int) $sess['sessions'],
+				'views'    => $view,
+			);
+		}
+
+		// Conversions, counted per UTC hour in SQL and placed on local days here.
+		$by_hour = function ( $sql ) use ( $wpdb ) {
+			return (array) $wpdb->get_results( $sql, ARRAY_A );
+		};
+		$forms = array();
+		if ( $ia['forms'] ) {
+			foreach ( $by_hour( $wpdb->prepare( "SELECT COALESCE(f.cached_form_title, CONCAT('Form ', fs.form_id)) AS form, DATE_FORMAT(fs.created_at, '%%Y-%%m-%%d %%H') AS h, COUNT(*) AS n FROM `{$p}form_submissions` fs LEFT JOIN `{$p}forms` f ON f.form_id = fs.form_id WHERE fs.created_at >= %s AND fs.created_at < %s GROUP BY form, h", $range_lo, $range_hi ) ) as $r ) {
+				$k = hw_monitor_local_day( $r['h'], $tz ) . "\0" . $r['form'];
+				$forms[ $k ] = ( isset( $forms[ $k ] ) ? $forms[ $k ] : 0 ) + (int) $r['n'];
+			}
+		}
+		$orders = array();
+		if ( $ia['orders'] ) {
+			foreach ( $by_hour( $wpdb->prepare( "SELECT DATE_FORMAT(created_at, '%%Y-%%m-%%d %%H') AS h, COUNT(*) AS n, COALESCE(SUM(total), 0) AS total, COALESCE(SUM(total_refunded), 0) AS refunded FROM `{$p}orders` WHERE is_included_in_analytics = 1 AND created_at >= %s AND created_at < %s GROUP BY h", $range_lo, $range_hi ) ) as $r ) {
+				$k = hw_monitor_local_day( $r['h'], $tz );
+				if ( ! isset( $orders[ $k ] ) ) {
+					$orders[ $k ] = array( 'day' => $k, 'orders' => 0, 'revenue_cents' => 0, 'refunded_cents' => 0 );
+				}
+				$orders[ $k ]['orders']         += (int) $r['n'];
+				$orders[ $k ]['revenue_cents']  += (int) $r['total'];
+				$orders[ $k ]['refunded_cents'] += (int) $r['refunded'];
+			}
+		}
+		$clicks = array();
+		if ( $ia['clicks'] ) {
+			foreach ( $by_hour( $wpdb->prepare( "SELECT DATE_FORMAT(created_at, '%%Y-%%m-%%d %%H') AS h, COUNT(*) AS n FROM `{$p}clicks` WHERE created_at >= %s AND created_at < %s GROUP BY h", $range_lo, $range_hi ) ) as $r ) {
+				$k = hw_monitor_local_day( $r['h'], $tz );
+				$clicks[ $k ] = ( isset( $clicks[ $k ] ) ? $clicks[ $k ] : 0 ) + (int) $r['n'];
+			}
 		}
 	}
 
@@ -433,6 +441,7 @@ function hw_monitor_ia_traffic( $from, $to, $tops ) {
 		'forms'     => array(),
 		'orders'    => array_values( $orders ),
 		'clicks'    => array(),
+		'tops_only' => $tops_only,
 	);
 	foreach ( $forms as $k => $n ) {
 		list( $day, $form ) = explode( "\0", $k, 2 );
@@ -451,7 +460,7 @@ function hw_monitor_ia_traffic( $from, $to, $tops ) {
 		$out['totals'] = array(
 			'visitors' => (int) $totals['visitors'],
 			'sessions' => (int) $totals['sessions'],
-			'views'    => array_sum( wp_list_pluck( $days, 'views' ) ),
+			'views'    => $tops_only ? (int) $wpdb->get_var( $wpdb->prepare( "SELECT COUNT(*) FROM `{$p}views` WHERE viewed_at >= %s AND viewed_at < %s", $range_lo, $range_hi ) ) : array_sum( wp_list_pluck( $days, 'views' ) ),
 		);
 		$out['pages']    = array_map(
 			function ( $r ) {
