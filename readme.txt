@@ -2,18 +2,22 @@
 Contributors: hostetlerweb
 Requires at least: 5.6
 Requires PHP: 7.4
-Stable tag: 1.2.0
+Stable tag: 1.3.0
 License: GPL-2.0-or-later
 
 Read-only report for the Hostetler Web dashboard.
 
 == Description ==
 
-Adds one REST endpoint, GET /wp-json/hw-monitor/v1/report, that answers only requests signed by the Hostetler Web dashboard (Ed25519; the public key is in public-keys.php, the private key only in the dashboard). It reports WordPress, PHP, plugin and theme versions and pending updates as WordPress last checked them. With ?from=&to= (up to 31 days) it adds Independent Analytics daily visitors, sessions and views, form submissions, orders and link clicks; with &tops=1 also top pages, channels, referrers and UTM campaigns. Days follow the site's own timezone.
+Adds one REST endpoint, GET /wp-json/hw-monitor/v1/report, that answers only requests signed by the Hostetler Web dashboard (Ed25519; the public key is in public-keys.php, the private key only in the dashboard). It reports WordPress, PHP, plugin and theme versions and pending updates as WordPress last checked them. With ?from=&to= (up to 31 days) it adds Independent Analytics daily visitors, sessions and views, form submissions, orders and link clicks (orders from WooCommerce itself when it's active); with &tops=1 also top pages, channels, referrers and UTM campaigns. Days follow the site's own timezone.
 
 There are no settings and no key to enter: installing it is the whole setup. Answering a request changes nothing on the site. Updates install automatically from GitHub releases.
 
 == Changelog ==
+
+= 1.3.0 =
+* Orders come from WooCommerce itself when it's active, instead of Independent Analytics: order count, full order total (shipping and tax included) and refunds, by the day the order was placed. Counts Processing, Completed, On hold and WooCommerce's other paid statuses, plus HW Puppy Deposits' Partially Paid and Fully Paid at the order's full total. Payment records and refunds aren't counted as orders. Works with HPOS and with orders stored as posts.
+* Traffic answers say where orders came from (orders_source), the order storage (orders_storage) and any database error reading them (orders_error). Sites without WooCommerce keep Independent Analytics' orders.
 
 = 1.2.0 =
 * Top lists for longer ranges: a request with tops_only=1 returns just the totals (with unique visitors) and the top pages, channels, referrers and UTM campaigns, for up to 366 days. The dashboard uses it for its 90-day and 12-month views. tops_only is signed with the rest of the range.

@@ -2,8 +2,8 @@
 /**
  * Plugin Name:       HW Site Monitor
  * Plugin URI:        https://github.com/Waldoweb/hw-site-monitor
- * Description:       Read-only report for the Hostetler Web dashboard: WordPress, PHP, plugin and theme versions, pending updates, and Independent Analytics traffic and conversions. Answers only requests signed by the dashboard, and reading the report changes nothing on the site.
- * Version:           1.2.0
+ * Description:       Read-only report for the Hostetler Web dashboard: WordPress, PHP, plugin and theme versions, pending updates, Independent Analytics traffic and conversions, and WooCommerce orders. Answers only requests signed by the dashboard, and reading the report changes nothing on the site.
+ * Version:           1.3.0
  * Author:            Hostetler Web
  * Author URI:        https://hostetlerweb.com
  * Update URI:        https://github.com/Waldoweb/hw-site-monitor
@@ -15,7 +15,7 @@
 
 defined( 'ABSPATH' ) || exit;
 
-define( 'HW_MONITOR_VERSION', '1.2.0' );
+define( 'HW_MONITOR_VERSION', '1.3.0' );
 
 // Updates come from GitHub releases through Plugin Update Checker. Pushing a vX.Y.Z
 // tag builds the release zip (.github/workflows/release.yml); sites check every 6
@@ -346,6 +346,71 @@ function hw_monitor_local_day( $utc_hour, $tz ) {
 }
 
 /**
+ * WooCommerce orders by local day (1.3+), in the same shape as IA's, or null when WooCommerce isn't
+ * active. Read from whichever order storage WooCommerce uses (HPOS tables or posts), one query.
+ * Only real orders count: refunds and other order types, like HW Puppy Deposits' payment records
+ * (wcdp_payment), are left out. The value is the order's full total with shipping and tax, also for
+ * a deposit order that isn't paid in full yet (Partially Paid).
+ *
+ * @return array|null|string Orders by day, null without WooCommerce, or the database error.
+ */
+function hw_monitor_woo_orders( $range_lo, $range_hi, $tz ) {
+	global $wpdb;
+	if ( ! class_exists( 'WooCommerce' ) ) {
+		return null;
+	}
+	$statuses = array( 'processing', 'completed', 'on-hold', 'partially-paid', 'fully-paid' );
+	if ( function_exists( 'wc_get_is_paid_statuses' ) ) {
+		$statuses = array_merge( $statuses, (array) wc_get_is_paid_statuses() );
+	}
+	$statuses = array_values(
+		array_unique(
+			array_map(
+				function ( $s ) {
+					return 'wc-' . preg_replace( '/^wc-/', '', (string) $s );
+				},
+				$statuses
+			)
+		)
+	);
+	$in = implode( ',', array_fill( 0, count( $statuses ), '%s' ) );
+
+	if ( hw_monitor_woo_hpos() ) {
+		$t   = $wpdb->prefix . 'wc_orders';
+		$sql = "SELECT o.date_created_gmt AS at, o.total_amount AS total, (SELECT COALESCE(SUM(ABS(r.total_amount)), 0) FROM `{$t}` r WHERE r.parent_order_id = o.id AND r.type = 'shop_order_refund') AS refunded FROM `{$t}` o WHERE o.type = 'shop_order' AND o.status IN ($in) AND o.date_created_gmt >= %s AND o.date_created_gmt < %s";
+	} else {
+		$sql = "SELECT p.post_date_gmt AS at, m.meta_value AS total, (SELECT COALESCE(SUM(ABS(rm.meta_value)), 0) FROM `{$wpdb->posts}` r JOIN `{$wpdb->postmeta}` rm ON rm.post_id = r.ID AND rm.meta_key = '_refund_amount' WHERE r.post_parent = p.ID AND r.post_type = 'shop_order_refund') AS refunded FROM `{$wpdb->posts}` p LEFT JOIN `{$wpdb->postmeta}` m ON m.post_id = p.ID AND m.meta_key = '_order_total' WHERE p.post_type = 'shop_order' AND p.post_status IN ($in) AND p.post_date_gmt >= %s AND p.post_date_gmt < %s";
+	}
+	$rows = $wpdb->get_results( $wpdb->prepare( $sql, array_merge( $statuses, array( $range_lo, $range_hi ) ) ), ARRAY_A ); // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared
+	if ( $wpdb->last_error ) {
+		return (string) $wpdb->last_error;
+	}
+
+	$orders = array();
+	$utc    = new DateTimeZone( 'UTC' );
+	foreach ( (array) $rows as $r ) {
+		try {
+			$k = ( new DateTimeImmutable( (string) $r['at'], $utc ) )->setTimezone( $tz )->format( 'Y-m-d' );
+		} catch ( Exception $e ) {
+			continue;
+		}
+		if ( ! isset( $orders[ $k ] ) ) {
+			$orders[ $k ] = array( 'day' => $k, 'orders' => 0, 'revenue_cents' => 0, 'refunded_cents' => 0 );
+		}
+		$orders[ $k ]['orders']++;
+		$orders[ $k ]['revenue_cents']  += (int) round( (float) $r['total'] * 100 );
+		$orders[ $k ]['refunded_cents'] += (int) round( (float) $r['refunded'] * 100 );
+	}
+	ksort( $orders );
+	return array_values( $orders );
+}
+
+/** Does WooCommerce keep orders in its own tables (HPOS)? In sync mode, whichever side it treats as the source. */
+function hw_monitor_woo_hpos() {
+	return class_exists( '\Automattic\WooCommerce\Utilities\OrderUtil' ) && \Automattic\WooCommerce\Utilities\OrderUtil::custom_orders_table_usage_is_enabled();
+}
+
+/**
  * Daily totals for local days $from..$to (at most 31), plus conversions, and top pages,
  * referrers, channels and campaigns when $tops. With $tops_only (1.2+) it's just the totals and
  * top lists, for up to 366 days: the dashboard's 90-day and 12-month views.
@@ -379,9 +444,11 @@ function hw_monitor_ia_traffic( $from, $to, $tops, $tops_only = false ) {
 	$range_lo = hw_monitor_utc_midnight( $from, $tz );
 	$range_hi = hw_monitor_utc_midnight( $end->modify( '+1 day' )->format( 'Y-m-d' ), $tz );
 
-	$days   = array();
-	$forms  = array();
-	$orders = array();
+	$days          = array();
+	$forms         = array();
+	$orders        = array();
+	$orders_source = null;
+	$orders_error  = null;
 	$clicks = array();
 	if ( ! $tops_only ) {
 		// One small indexed range query per day: sessions, distinct visitors, page views.
@@ -410,8 +477,17 @@ function hw_monitor_ia_traffic( $from, $to, $tops, $tops_only = false ) {
 				$forms[ $k ] = ( isset( $forms[ $k ] ) ? $forms[ $k ] : 0 ) + (int) $r['n'];
 			}
 		}
-		$orders = array();
-		if ( $ia['orders'] ) {
+		// WooCommerce's own orders when it's active (1.3+): the real record, from before IA was
+		// installed too. IA's orders only on sites without WooCommerce, or when that query fails.
+		$woo = hw_monitor_woo_orders( $range_lo, $range_hi, $tz );
+		if ( is_array( $woo ) ) {
+			$orders_source = 'woocommerce';
+			$orders        = $woo;
+		} elseif ( is_string( $woo ) ) {
+			$orders_error = $woo;
+		}
+		if ( 'woocommerce' !== $orders_source && $ia['orders'] ) {
+			$orders_source = 'ia';
 			foreach ( $by_hour( $wpdb->prepare( "SELECT DATE_FORMAT(created_at, '%%Y-%%m-%%d %%H') AS h, COUNT(*) AS n, COALESCE(SUM(total), 0) AS total, COALESCE(SUM(total_refunded), 0) AS refunded FROM `{$p}orders` WHERE is_included_in_analytics = 1 AND created_at >= %s AND created_at < %s GROUP BY h", $range_lo, $range_hi ) ) as $r ) {
 				$k = hw_monitor_local_day( $r['h'], $tz );
 				if ( ! isset( $orders[ $k ] ) ) {
@@ -440,6 +516,11 @@ function hw_monitor_ia_traffic( $from, $to, $tops, $tops_only = false ) {
 		'days'      => $days,
 		'forms'     => array(),
 		'orders'    => array_values( $orders ),
+		// 1.3+: where orders came from ("woocommerce", "ia" or null), the WooCommerce order storage,
+		// and the database error when WooCommerce's orders couldn't be read
+		'orders_source'  => $orders_source,
+		'orders_storage' => class_exists( 'WooCommerce' ) ? ( hw_monitor_woo_hpos() ? 'hpos' : 'posts' ) : null,
+		'orders_error'   => $orders_error,
 		'clicks'    => array(),
 		'tops_only' => $tops_only,
 	);
